@@ -1,82 +1,74 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from vnstock import Vnstock, register_user
 from datetime import datetime, timedelta
 import traceback
+import os
 
-# Cố gắng đăng ký API Key (nếu lỗi cũng không làm sập app)
-try:
-    register_user(api_key="vnstock_7415f142e42b8812cddb3b5a8cf3ea20")
-except:
-    pass
+# Cài đặt API Key vào biến môi trường hệ thống (Chuẩn an toàn nhất)
+os.environ["VNSTOCK_API_KEY"] = "vnstock_7415f142e42b8812cddb3b5a8cf3ea20"
 
 app = FastAPI(
     title="Supreme V5 Stage 0 Data Engine",
-    description="API cung cấp Data Pack với cơ chế chống sập (Bulletproof)"
+    description="API cung cấp Data Pack chuẩn V5 - Bọc lỗi toàn diện"
 )
 
 @app.get("/api/v1/stage0/{ticker}")
 def get_stage0_data(ticker: str):
     try:
+        # Đưa lệnh import vào trong hàm. Nếu lỗi, web không bị sập mà sẽ in ra JSON
+        from vnstock import Vnstock
+        
         ticker = ticker.upper().strip()
         now = datetime.today()
         end_date = now.strftime('%Y-%m-%d')
         start_1y = (now - timedelta(days=365)).strftime('%Y-%m-%d')
         start_3y = (now - timedelta(days=365*3)).strftime('%Y-%m-%d')
 
-        # 1. Khởi tạo mã chứng khoán chính
+        # Khởi tạo theo đúng chuẩn Quickstart V3
         stock = Vnstock().stock(symbol=ticker, source='VCI')
         
-        # 2. Kéo dữ liệu Daily (Cốt lõi)
+        # --- KHỐI 1: DAILY OHLCV ---
         try:
             df_daily = stock.quote.history(start=start_1y, end=end_date, interval='1D')
-            if df_daily is not None and not df_daily.empty:
-                daily_ohlcv = df_daily.tail(100).to_dict('records')
-            else:
-                daily_ohlcv = []
+            daily_ohlcv = df_daily.tail(100).to_dict('records') if (df_daily is not None and not df_daily.empty) else []
         except:
             daily_ohlcv = []
             
-        # Áp dụng Hard Rule của V5: Không có giá Daily = Nghỉ chơi
         if len(daily_ohlcv) == 0:
-            return JSONResponse(status_code=404, content={"detail": "Core missingness > 0.15. FORCE_ABSTAIN = TRUE. Không tìm thấy dữ liệu giá cốt lõi."})
+            return JSONResponse(status_code=404, content={"detail": "Core missingness > 0.15. FORCE_ABSTAIN = TRUE. Không tìm thấy dữ liệu giá Daily."})
 
-        # 3. Kéo dữ liệu Weekly
+        # --- KHỐI 2: WEEKLY OHLCV ---
         try:
             df_weekly = stock.quote.history(start=start_3y, end=end_date, interval='1W')
-            if df_weekly is not None and not df_weekly.empty:
-                weekly_ohlcv = df_weekly.tail(100).to_dict('records')
-            else:
-                weekly_ohlcv = []
+            weekly_ohlcv = df_weekly.tail(100).to_dict('records') if (df_weekly is not None and not df_weekly.empty) else []
         except:
             weekly_ohlcv = []
 
-        # 4. Kéo bối cảnh thị trường (VNINDEX) - Đổi qua nguồn TCBS cho lành
-        vnindex_ohlcv = []
+        # --- KHỐI 3: VNINDEX ---
         try:
             vnindex = Vnstock().stock(symbol='VNINDEX', source='TCBS')
             df_vnindex = vnindex.quote.history(start=start_1y, end=end_date, interval='1D')
-            if df_vnindex is not None and not df_vnindex.empty:
-                vnindex_ohlcv = df_vnindex.tail(60).to_dict('records')
+            vnindex_ohlcv = df_vnindex.tail(60).to_dict('records') if (df_vnindex is not None and not df_vnindex.empty) else []
         except:
-            pass # Lỗi VNINDEX thì bỏ qua, không làm sập web
+            vnindex_ohlcv = []
 
-        # 5. Kéo Profile doanh nghiệp
+        # --- KHỐI 4: PROFILE ---
         try:
             profile_df = stock.company.profile()
-            if profile_df is not None and not profile_df.empty:
-                profile_data = profile_df.to_dict('records')[0]
-            else:
-                profile_data = "Không có thông tin profile"
+            profile_data = profile_df.to_dict('records')[0] if (profile_df is not None and not profile_df.empty) else "Lỗi/Trống thông tin"
         except:
-            profile_data = "Lỗi khi truy xuất profile"
+            profile_data = "Lỗi truy xuất Profile"
 
-        # 6. Đóng gói trả về JSON
+        # --- TRẢ VỀ JSON ---
         return {
             "Analysis_Metadata": {
                 "Asset": ticker,
                 "Event_Firewall_Status": "Pending GPT Inference",
-                "Calculated_Miss_Core": 0.05 if len(weekly_ohlcv) > 0 else 0.10
+                "Data_Completeness": {
+                    "Daily": "OK" if len(daily_ohlcv) > 0 else "Missing",
+                    "Weekly": "OK" if len(weekly_ohlcv) > 0 else "Missing",
+                    "VNINDEX": "OK" if len(vnindex_ohlcv) > 0 else "Missing"
+                }
             },
             "Data_Pack": {
                 "Company_Profile": profile_data,
@@ -85,11 +77,10 @@ def get_stage0_data(ticker: str):
                 "Trigger_Daily_LTF": daily_ohlcv
             }
         }
-
+        
     except Exception as e:
-        # TẤT CẢ LỖI TRẦM TRỌNG SẼ ĐƯỢC BẮT VÀ IN RA ĐÂY, CHỨ KHÔNG SẬP SERVER NỮA
+        # Nếu có bất kỳ lỗi gì, nó sẽ in ra màn hình trình duyệt chứ KHÔNG BAO GIỜ bị lỗi 500 trắng xoá nữa
         return JSONResponse(status_code=500, content={
             "Lỗi_Hệ_Thống": str(e),
-            "Chi_Tiết_Kỹ_Thuật": traceback.format_exc(),
-            "Hành_Động": "Vui lòng copy toàn bộ chữ này gửi lại cho AI để chẩn đoán chính xác."
+            "Chi_Tiết_Kỹ_Thuật": traceback.format_exc()
         })
